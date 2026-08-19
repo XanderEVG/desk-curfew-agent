@@ -4,8 +4,8 @@ mqtt:
   host: "srv2.clusterfly.ru"
   port: 9992
   use_ssl: true
-  username: "user_cd570e40"
+  username: "user"
   password: "your_password"
-  topic_prefix: "user_cd570e40/curfew/kids"
+  topic_prefix: "user/curfew/kids"
 
 heartbeat_interval: 30
