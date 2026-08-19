@@ -1,0 +1,11 @@
+pc_name: "evgeny_pc"
+
+mqtt:
+  host: "srv2.clusterfly.ru"
+  port: 9992
+  use_ssl: true
+  username: "user_cd570e40"
+  password: "your_password"
+  topic_prefix: "user_cd570e40/curfew/kids"
+
+heartbeat_interval: 30
