@@ -1,220 +1,323 @@
-import json
+"""Точка входа агента desk-curfew.
+
+Шаг (d): конфиг + HTTP-поллинг + события + idle + тосты + BSOD + хук + PIN + fail-open.
+Последующий шаг: упаковка PyInstaller (e).
+"""
+
+from __future__ import annotations
+
 import logging
-import os
-import subprocess
+import logging.handlers
 import sys
-import threading
-import time
-from datetime import datetime, timezone
+from pathlib import Path
+from queue import Empty, Queue
+from typing import Any
 
-import paho.mqtt.client as mqtt
-import yaml
-from PyQt6.QtWidgets import QApplication
+from PySide6.QtCore import QTimer
+from PySide6.QtWidgets import QApplication
 
-from lock_window import LockWindow
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[
-        logging.FileHandler("agent.log", encoding="utf-8"),
-        logging.StreamHandler()
-    ]
-)
-log = logging.getLogger("kids_agent")
+from agent.config import load_config
+from agent.events import EventBuffer
+from agent.hooks import KeyboardHook
+from agent.http_client import HTTPClient
+from agent.idle import IdleTracker
+from agent.lock_screen import LockScreen
+from agent.pin_dialog import PinDialog
+from agent.toast import LockInToast, ToastManager
 
 
-class KidsAgent:
-    def __init__(self, config_path="config.yaml"):
-        with open(config_path, "r", encoding="utf-8") as f:
-            self.cfg = yaml.safe_load(f)
+def _setup_logging(log_file: str, max_mb: int, backups: int) -> None:
+    """Ротационный файловый лог + консоль."""
+    root = logging.getLogger()
+    root.setLevel(logging.DEBUG)
 
-        self.pc_name = self.cfg["pc_name"]
-        self.mqtt_cfg = self.cfg["mqtt"]
-        self.topic_prefix = self.mqtt_cfg["topic_prefix"]
+    fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
 
-        self.locked = False
-        self.lock_reason = None
-        self.lock_window = None
-        self.qt_app = None
+    exe_dir = Path(sys.executable).parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent.parent
+    fh = logging.handlers.RotatingFileHandler(
+        exe_dir / log_file,
+        maxBytes=max_mb * 1024 * 1024,
+        backupCount=backups,
+        encoding="utf-8",
+    )
+    fh.setLevel(logging.DEBUG)
+    fh.setFormatter(fmt)
+    root.addHandler(fh)
 
-        self.client = mqtt.Client(
-            callback_api_version=mqtt.CallbackAPIVersion.VERSION2,
-            client_id=f"agent-{self.pc_name}",
+    ch = logging.StreamHandler()
+    ch.setLevel(logging.INFO)
+    ch.setFormatter(fmt)
+    root.addHandler(ch)
+
+
+log = logging.getLogger(__name__)
+
+
+class AgentApp:
+    """Главный класс агента. Работает внутри Qt event loop."""
+
+    def __init__(self) -> None:
+        self._cfg = load_config()
+        _setup_logging(self._cfg.log_file, self._cfg.log_max_mb, self._cfg.log_backups)
+
+        self._command_queue: Queue[dict[str, Any]] = Queue()
+        self._events = EventBuffer()
+        self._idle = IdleTracker()
+        self._http = HTTPClient(
+            server_url=self._cfg.server_url,
+            agent_token=self._cfg.agent_token,
+            pc_name=self._cfg.pc_name,
+            heartbeat_interval=self._cfg.heartbeat_interval,
+            command_queue=self._command_queue,
+            event_buffer=self._events,
+            idle_tracker=self._idle,
         )
 
-        if self.mqtt_cfg.get("use_ssl"):
-            self.client.tls_set()
+        self._toasts = ToastManager()
+        self._lock_in_toast: LockInToast | None = None
+        self._lock_screen: LockScreen | None = None
+        self._pin_dialog: PinDialog | None = None
 
-        self.client.username_pw_set(
-            self.mqtt_cfg["username"],
-            self.mqtt_cfg["password"]
+        self._locked = False
+        self._lock_reason: str | None = None
+
+        # Хук клавиатуры (Windows)
+        self._hook = KeyboardHook(
+            on_secret_combo=self._on_secret_combo,
+            is_locked=lambda: self._locked,
         )
 
-        # Last Will: если агент упадёт, сервер узнает
-        self.client.will_set(
-            f"{self.topic_prefix}/{self.pc_name}/status",
-            json.dumps({"online": False, "ts": self._now_iso()}),
-            qos=1, retain=True
-        )
+        # Fail-open таймер (проверка каждые 60 с)
+        self._fail_open_timer = QTimer()
+        self._fail_open_timer.timeout.connect(self._check_fail_open)
 
-        self.client.on_connect = self._on_connect
-        self.client.on_message = self._on_message
-        self.client.on_disconnect = self._on_disconnect
+        log.info("Агент инициализирован: pc=%s", self._cfg.pc_name)
 
-    def _now_iso(self):
-        return datetime.now(timezone.utc).isoformat()
+    def run(self) -> None:
+        """Запуск Qt event loop + HTTP-поллинг."""
+        app = QApplication.instance() or QApplication(sys.argv)
 
-    def _on_connect(self, client, userdata, flags, reason_code, properties):
-        if reason_code == 0:
-            log.info("Подключён к MQTT!")
-            client.subscribe(f"{self.topic_prefix}/{self.pc_name}/cmd", qos=1)
-            self._publish_status()
-            self._publish_event("agent_started")
+        # Таймер обработки команд из HTTP-очереди
+        cmd_timer = QTimer()
+        cmd_timer.timeout.connect(self._poll_commands)
+        cmd_timer.start(500)  # проверка каждые 500 мс
+
+        # Запуск HTTP-потока и хука
+        self._http.start()
+        self._hook.start()
+
+        # Запуск fail-open таймера (если включён)
+        if self._cfg.fail_open_hours > 0:
+            self._fail_open_timer.start(60_000)  # проверка каждые 60 с
+            log.info("Fail-open: включён (%d часов)", self._cfg.fail_open_hours)
+
+        log.info("Агент запущен (шаг d — HTTP + events + тосты + BSOD + хук + PIN + fail-open)")
+
+        # Graceful shutdown
+        app.aboutToQuit.connect(self._shutdown)
+
+        exit_code = app.exec()
+        log.info("Qt event loop завершён (exit=%d)", exit_code)
+
+    def _poll_commands(self) -> None:
+        """Обработать все накопившиеся команды из очереди."""
+        while True:
+            try:
+                cmd = self._command_queue.get_nowait()
+            except Empty:
+                break
+            self._handle_command(cmd)
+
+    def _handle_command(self, cmd: dict[str, Any]) -> None:
+        action = cmd.get("action")
+        log.info("Обработка команды: %s", action)
+
+        if action == "lock_now":
+            self._cmd_lock_now(cmd)
+        elif action == "lock_in":
+            self._cmd_lock_in(cmd)
+        elif action == "unlock":
+            self._cmd_unlock(cmd)
+        elif action == "add_time":
+            self._cmd_add_time(cmd)
         else:
-            log.error(f"Ошибка подключения к MQTT: {reason_code}")
+            log.warning("Неизвестная команда: %s", action)
 
-    def _on_disconnect(self, client, userdata, flags, reason_code, properties):
-        log.warning(f"Отключён от MQTT: {reason_code}")
+    def _cmd_lock_now(self, cmd: dict[str, Any]) -> None:
+        reason = cmd.get("reason", "manual")
+        info = cmd.get("info")
 
-    def _on_message(self, client, userdata, msg):
-        try:
-            payload = json.loads(msg.payload.decode("utf-8"))
-            action = payload.get("action")
-            log.info(f"Получена команда: {action} -> {payload}")
+        # Идемпотентность: если уже заблокированы — no-op, но шлём event
+        if self._locked:
+            log.info("lock_now: уже заблокированы (reason=%s) — no-op + event", self._lock_reason)
+            self._events.add("locked", reason)
+            return
 
-            if action == "lock_now":
-                self._do_lock(payload.get("reason", "manual"))
-            elif action == "lock_in":
-                self._schedule_lock(payload)
-            elif action == "unlock":
-                self._do_unlock(payload.get("reason", "manual"))
-            elif action == "shutdown_in":
-                self._schedule_shutdown(payload)
-            elif action == "add_time":
-                log.info("Добавлено время, сбрасываем таймеры блокировки")
+        # Отменить lock_in таймер, если идёт
+        if self._lock_in_toast:
+            self._lock_in_toast.cancel()
+            self._lock_in_toast = None
 
-        except Exception as e:
-            log.error(f"Ошибка обработки сообщения: {e}")
+        self._locked = True
+        self._lock_reason = reason
+        self._http.set_locked(True, reason)
 
-    def _do_lock(self, reason):
-        if self.locked: return
-        self.locked = True
-        self.lock_reason = reason
-        log.info(f"Блокировка: {reason}")
-        self._publish_event("locked", reason=reason)
-        self._publish_status()
+        # Показать BSOD-экран
+        self._show_lock_screen(info, reason)
+        log.info("Заблокировано (reason=%s) — BSOD показан", reason)
+        self._events.add("locked", reason)
 
-        # Показываем окно в главном потоке Qt
-        if self.qt_app:
-            self.qt_app.show_lock_window(reason)
+    def _cmd_lock_in(self, cmd: dict[str, Any]) -> None:
+        delay = cmd.get("delay_seconds", 0)
+        reason = cmd.get("reason", "manual")
 
-    def _do_unlock(self, reason):
-        if not self.locked: return
-        self.locked = False
-        self.lock_reason = None
-        log.info(f"Разблокировка: {reason}")
-        self._publish_event("unlocked", reason=reason)
-        self._publish_status()
+        if delay <= 0:
+            # degenerate — блокируем сразу
+            log.info("lock_in: delay=0 — блокирую сразу")
+            self._cmd_lock_now(cmd)
+            return
 
-        if self.qt_app:
-            self.qt_app.hide_lock_window()
+        # Отменить предыдущий lock_in, если был
+        if self._lock_in_toast:
+            self._lock_in_toast.cancel()
 
-    def _schedule_lock(self, payload):
-        delay = payload.get("delay_seconds", 300)
-        reason = payload.get("reason", "schedule")
-
-        def _run():
-            log.info(f"Запланирована блокировка через {delay} сек")
-            time.sleep(delay)
-            if not self.locked:
-                self._do_lock(reason)
-
-        threading.Thread(target=_run, daemon=True).start()
-
-    def _schedule_shutdown(self, payload):
-        delay = payload.get("delay_seconds", 60)
-
-        def _run():
-            time.sleep(delay)
-            log.info("Выключаю компьютер...")
-            subprocess.run(["shutdown", "/s", "/f", "/t", "0"])
-
-        threading.Thread(target=_run, daemon=True).start()
-
-    def _publish_status(self):
-        topic = f"{self.topic_prefix}/{self.pc_name}/status"
-        payload = {
-            "online": True,
-            "locked": self.locked,
-            "lock_reason": self.lock_reason,
-            "user": os.environ.get("USERNAME", "unknown"),
-            "ts": self._now_iso()
-        }
-        self.client.publish(topic, json.dumps(payload), qos=1, retain=True)
-
-    def _publish_event(self, event, **kwargs):
-        topic = f"{self.topic_prefix}/{self.pc_name}/event"
-        payload = {"event": event, "ts": self._now_iso(), **kwargs}
-        self.client.publish(topic, json.dumps(payload), qos=1)
-
-    def _publish_heartbeat(self):
-        topic = f"{self.topic_prefix}/{self.pc_name}/hb"
-        payload = {
-            "ts": self._now_iso(),
-            "active_user": os.environ.get("USERNAME", "unknown"),
-            "locked": self.locked
-        }
-        self.client.publish(topic, json.dumps(payload), qos=0)
-
-    def run_mqtt_loop(self):
-        self.client.connect(
-            self.mqtt_cfg["host"],
-            self.mqtt_cfg.get("port", 9992),
-            keepalive=60
+        self._events.add("warning_shown", reason)
+        # Передаём info в callback, чтобы при истечении показать BSOD с данными
+        info = cmd.get("info")
+        self._lock_in_toast = LockInToast(
+            delay,
+            on_expire=lambda: self._on_lock_in_expire(reason, info),
         )
-        self.client.loop_start()
+        log.info("lock_in: тост с обратным отсчётом %d с (reason=%s)", delay, reason)
 
-        interval = self.cfg.get("heartbeat_interval", 30)
-        try:
-            while True:
-                self._publish_heartbeat()
-                time.sleep(interval)
-        except KeyboardInterrupt:
-            self.client.loop_stop()
-            self.client.disconnect()
+    def _on_lock_in_expire(self, reason: str, info: dict[str, Any] | None = None) -> None:
+        """По истечении lock_in — блокировать."""
+        self._lock_in_toast = None
+        self._locked = True
+        self._lock_reason = reason
+        self._http.set_locked(True, reason)
+
+        # Показать BSOD-экран
+        self._show_lock_screen(info, reason)
+        log.info("lock_in истёк — заблокировано (reason=%s) — BSOD показан", reason)
+        self._events.add("locked", reason)
+
+    def _cmd_unlock(self, cmd: dict[str, Any]) -> None:
+        reason = cmd.get("reason", "manual")
+
+        if not self._locked:
+            log.info("unlock: не заблокированы — no-op")
+            return
+
+        # Отменить lock_in таймер, если идёт
+        if self._lock_in_toast:
+            self._lock_in_toast.cancel()
+            self._lock_in_toast = None
+
+        self._locked = False
+        self._lock_reason = None
+        self._http.set_locked(False, None)
+
+        # Скрыть BSOD-экран
+        self._hide_lock_screen()
+
+        self._toasts.show("🔓 Разблокировано", duration_ms=3000)
+        log.info("Разблокировано (reason=%s)", reason)
+        self._events.add("unlocked", reason)
+
+    def _cmd_add_time(self, cmd: dict[str, Any]) -> None:
+        minutes = cmd.get("minutes", 0)
+        self._toasts.show(f"➕ +{minutes} минут", duration_ms=4000)
+        log.info("add_time: +%d мин — тост показан", minutes)
+
+    def _show_lock_screen(self, info: dict[str, Any] | None, reason: str) -> None:
+        """Показать BSOD-экран блокировки."""
+        if self._lock_screen:
+            self._lock_screen.hide_lock()
+        self._lock_screen = LockScreen(info=info, reason=reason)
+        self._lock_screen.show_fullscreen()
+
+    def _hide_lock_screen(self) -> None:
+        """Скрыть BSOD-экран."""
+        if self._lock_screen:
+            self._lock_screen.hide_lock()
+            self._lock_screen = None
+
+    def _on_secret_combo(self) -> None:
+        """Секретная комбинация Ctrl+Alt+Shift+F12 — показать PIN-пад."""
+        log.info("Секретная комбинация — показываю PIN-пад")
+        if self._pin_dialog and self._pin_dialog.isVisible():
+            self._pin_dialog.hide()
+
+        self._pin_dialog = PinDialog(
+            pin_hash=self._cfg.pin_hash,
+            on_unlock=self._pin_unlock,
+            on_close_agent=self._pin_close_agent,
+            on_wrong_pin=self._pin_wrong,
+        )
+        self._pin_dialog.show()
+
+    def _pin_unlock(self) -> None:
+        """PIN верный → Разблокировать."""
+        if self._locked:
+            self._locked = False
+            self._lock_reason = None
+            self._http.set_locked(False, None)
+            self._hide_lock_screen()
+            self._toasts.show("🔓 Разблокировано через PIN", duration_ms=3000)
+            self._events.add("unlocked", "pin")
+            log.info("PIN: разблокировано")
+
+    def _pin_close_agent(self) -> None:
+        """PIN верный → Закрыть агент."""
+        log.info("PIN: закрытие агента по решению родителя")
+        app = QApplication.instance()
+        if app:
+            app.quit()
+
+    def _pin_wrong(self) -> None:
+        """PIN неверный → event pin_attempt."""
+        self._events.add("pin_attempt")
+        log.warning("PIN: неверный PIN — event pin_attempt")
+
+    def _check_fail_open(self) -> None:
+        """Проверить fail-open: нет связи fail_open_hours подряд + заблокирован → разблокировать."""
+        if self._cfg.fail_open_hours <= 0:
+            return
+
+        threshold_seconds = self._cfg.fail_open_hours * 3600
+        elapsed = self._http.seconds_since_last_success
+
+        if elapsed >= threshold_seconds and self._locked:
+            log.critical(
+                "Fail-open: нет связи %.1f с (порог %d с) — разблокирую",
+                elapsed,
+                threshold_seconds,
+            )
+            self._locked = False
+            self._lock_reason = None
+            self._http.set_locked(False, None)
+            self._hide_lock_screen()
+            self._events.add("fail_open")
+            self._toasts.show("⚠️ Fail-open: разблокировано (нет связи)", duration_ms=5000)
+
+    def _shutdown(self) -> None:
+        self._events.add("agent_stopped")
+        self._http.stop()
+        self._hook.stop()
+        self._toasts.stop()
+        self._fail_open_timer.stop()
+        if self._lock_screen:
+            self._lock_screen.hide_lock()
+        if self._pin_dialog:
+            self._pin_dialog.hide()
+        log.info("Агент остановлен")
 
 
-class QtAppManager:
-    """Менеджер для безопасного вызова GUI из потока MQTT."""
-
-    def __init__(self):
-        self.app = QApplication(sys.argv)
-        self.window = None
-
-    def show_lock_window(self, reason):
-        if not self.window:
-            self.window = LockWindow(reason)
-        self.window.show_fullscreen()
-
-    def hide_lock_window(self):
-        if self.window:
-            self.window.close()
-            self.window = None
-
-    def start_qt_loop(self):
-        # Запускает Qt event loop. Он будет крутиться в главном потоке.
-        sys.exit(self.app.exec())
+def main() -> None:
+    app = AgentApp()
+    app.run()
 
 
 if __name__ == "__main__":
-    agent = KidsAgent()
-    qt_manager = QtAppManager()
-    agent.qt_app = qt_manager
-
-    # Запускаем MQTT и heartbeat в отдельном потоке
-    mqtt_thread = threading.Thread(target=agent.run_mqtt_loop, daemon=True)
-    mqtt_thread.start()
-
-    # Главный поток отдаём под Qt (иначе окно не будет реагировать)
-    qt_manager.start_qt_loop()
+    main()

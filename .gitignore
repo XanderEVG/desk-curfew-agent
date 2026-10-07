@@ -33,6 +33,7 @@ logs/
 .env.local
 .env.*.local
 config.yaml
+config.ini
 
 # Docker
 docker-compose.override.yml

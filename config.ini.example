@@ -1,0 +1,24 @@
+# === Идентификация ПК ===
+
+[agent]
+# Имя ПК — как заведено на сервере (evgeny_pc / andrey_pc)
+pc_name = evgeny_pc
+server_url = http://192.168.1.100:8000
+agent_token = <raw_token>
+heartbeat_interval = 10
+
+# === Безопасность ===
+[security]
+# Хеш PIN родителя. Оставь пустым — агент попросит создать PIN
+# при первом запуске и сам запишет хеш сюда.
+pin_hash =
+# Авто-разблокировка, если нет связи с сервером дольше N часов.
+# 0 = выключено.
+fail_open_hours = 12
+
+# === Логирование ===
+[logging]
+# Файл лога рядом с exe; ротация по размеру
+log_file = agent.log
+log_max_mb = 5
+log_backups = 3
